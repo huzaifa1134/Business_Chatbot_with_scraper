@@ -1,15 +1,17 @@
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from llm.manager import get_best_answer
 from rag.embeddings import build_vector_store, get_context
-from scraping.extractor import extract_text, get_logo
+from scraping.extractor import crawl_website, get_logo, save_faiss_index, load_faiss_index, save_chunks, load_chunks
+import os
 from fastapi.middleware.cors import CORSMiddleware
-
+import pickle
 
 app = FastAPI(
-  title="Smart Web Chatbot(Powered by HF and Gemini)",
-  description="Scrapes websites and answers via Hugging Face (default) with Gemini fallback. Supports dynamic company adaptation with logo.",
-  version="1.2.0"
+    title="Smart Web Chatbot(Powered by Gemini)",
+    description="Scrapes websites and answers via Hugging Face (default) with Gemini fallback. Supports dynamic company adaptation with logo.",
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -22,14 +24,18 @@ app.add_middleware(
 
 sessions = {}
 
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
 class ScrapeRequest(BaseModel):
-  user_id: str
-  company_name: str
-  company_url: str
+    user_id: str
+    company_name: str
+    company_url: str
 
 class QuestionRequest(BaseModel):
-  user_id: str
-  question: str
+    user_id: str
+    question: str
+
 
 @app.get("/health")
 def health_check():
@@ -37,71 +43,88 @@ def health_check():
 
 @app.post("/scrape")
 def scrape_page(req: ScrapeRequest):
-  text = extract_text(req.company_url)
-  if not text or len(text) < 100:
-    raise HTTPException(
-       status_code=400,
-       detail="Failed to extract text. Text is too short.")
-  
-  chunks, index = build_vector_store(text)
-  logo_url = get_logo(req.company_url)
+    domain = req.company_url.replace("https://", "").replace("http://", "").replace("/", "")
+    folder_path = os.path.join(DATA_DIR, domain)
+    os.makedirs(folder_path, exist_ok=True)
+    index_path = os.path.join(folder_path, "index.faiss")
+    chunks_path = os.path.join(folder_path, "chunks.pkl")
 
-  sessions[req.user_id] = {
-    "company_name": req.company_name,
-    "company_logo": logo_url,
-    "company_url": req.company_url,
-    "chunks": chunks,
-    "index": index
-  }
+    if os.path.exists(index_path) and os.path.exists(chunks_path):
+        index = load_faiss_index(index_path)
+        chunks = load_chunks(chunks_path)
+    else:
+        pages = crawl_website(req.company_url, max_pages=15)
+        if not pages:
+            raise HTTPException(status_code=400, detail="Failed to extract text.")
+        all_text = "\n".join([p['text'] for p in pages])
+        chunks, index = build_vector_store(all_text)
+        save_faiss_index(index, index_path)
+        save_chunks(chunks, chunks_path)
 
-  return {
-    "message": "Scraping complete.",
-    "chunks": len(chunks),
-    "company_logo": logo_url
-  }
+    logo_url = get_logo(req.company_url)
+    sessions[req.user_id] = {
+        "company_name": req.company_name,
+        "company_url": req.company_url,
+        "company_logo": logo_url,
+        "chunks": chunks,
+        "index": index,
+        "history": []
+    }
+
+    return {
+        "message": "Scraping complete.",
+        "chunks": len(chunks),
+        "company_logo": logo_url
+    }
+
 @app.post("/ask")
 def ask_question(req: QuestionRequest):
-    try:
-        session = sessions.get(req.user_id)
-        if not session:
-            raise HTTPException(
-                status_code=400,
-                detail="No session found for this user. Please scrape a company first."
-            )
-
-        print(f"[DEBUG] Session found for user: {req.user_id}")
-        print(f"[DEBUG] Question: {req.question}")
+    session = sessions.get(req.user_id)
+    if not session:
+        prompt= f"User Asked: {req.question}\nAnswer as a helpful assistant."
+        answer = get_best_answer(prompt)
+        return{
+            "answer": answer,
+            "company_name": None,
+            "company_logo": None,
+            "context_used": []
+        }
         
-        context = get_context(req.question, session)
-        print(f"[DEBUG] Context retrieved: {len(context)} chunks")
-        
-        context_text = "\n\n".join(context)
 
-        prompt = f"""You are now the official chatbot for {session['company_name']}.
-Use the following information to answer accurately and in the company's tone:
+    context_chunks = get_context(req.question, session)
+    context_text = "\n\n".join(context_chunks)
 
+    history_text = ""
+    for h in session['history']:
+        history_text += f"User: {h['user']}\nBot: {h['bot']}\n"
+
+    prompt = f"""
+You are the official chatbot for {session['company_name']}.
+Use the following information to answer accurately and in company's tone:
+
+Previous chat history:
+{history_text}
+
+Relevant information from website:
 {context_text}
 
-Question: {req.question}"""
-        
-        print(f"[DEBUG] Getting answer from LLM...")
-        answer = get_best_answer(prompt)
-        print(f"[DEBUG] Answer received: {len(answer)} chars")
-        
-        return {
-            "answer": answer,
-            "company_name": session["company_name"],
-            "company_logo": session["company_logo"],
-            "context_used": context[:2]
-        }
-    except HTTPException as e:
-        print(f"[ERROR] HTTP Exception: {e.detail}")
-        raise
+Current question: {req.question}
+"""
+    try:
+      answer = get_best_answer(prompt)
     except Exception as e:
-        print(f"[ERROR] Unexpected error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal server error: {str(e)}"
-        )
+      if "RESOURCE_EXHAUSTED" in str(e):
+        answer = "Sorry, the system is currently experiencing high load. Please try again later."
+      else:
+        answer = f"Sorry, I couldn't get an answer at this time. {str(e)}"
+
+    session['history'].append({"user": req.question, "bot": answer})
+    if len(session['history']) > 6:
+        session['history'] = session['history'][-6:]
+
+    return {
+        "answer": answer,
+        "company_name": session["company_name"],
+        "company_logo": session["company_logo"],
+        "context_used": context_chunks[:2]
+    }
